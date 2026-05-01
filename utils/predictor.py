@@ -20,18 +20,24 @@ FEATURE_COLS = [
 ]
 
 def _find_model_dir():
-    """Find models/ directory — works locally and on Streamlit Cloud."""
+    """
+    Find directory containing clay_model.pkl.
+    Checks repo root, models/, utils/../, and Streamlit Cloud paths.
+    """
     this_file = Path(__file__).resolve()
     candidates = [
-        this_file.parent.parent / "models",   # repo root / models  (main case)
-        this_file.parent       / "models",    # utils / models
-        Path(os.getcwd())      / "models",    # cwd / models
-        Path("/mount/src/srd") / "models",    # Streamlit Cloud explicit path
+        this_file.parent.parent,            # repo root  ← files are here now
+        this_file.parent.parent / "models", # repo root / models
+        this_file.parent,                   # utils/
+        Path(os.getcwd()),                  # cwd
+        Path(os.getcwd()) / "models",       # cwd / models
+        Path("/mount/src/srd"),             # Streamlit Cloud repo root
+        Path("/mount/src/srd") / "models",  # Streamlit Cloud models/
     ]
     for c in candidates:
-        if c.is_dir():
-            return str(c)                     # return first existing dir, no glob
-    return str(candidates[0])                 # fallback
+        if c.is_dir() and (c / "clay_model.pkl").exists():
+            return str(c)
+    return str(this_file.parent.parent)     # fallback: repo root
 
 MODEL_DIR = _find_model_dir()
 
@@ -40,24 +46,24 @@ def get_debug_info():
     file_info = []
     if model_dir.exists():
         for f in sorted(model_dir.iterdir()):
-            try:
-                size = f.stat().st_size
-                # Check if pkl file is a git-lfs pointer (< 200 bytes = pointer, not real model)
-                is_lfs = size < 200 and f.suffix == ".pkl"
-                file_info.append({
-                    "name": f.name,
-                    "size_bytes": size,
-                    "is_lfs_pointer": is_lfs
-                })
-            except:
-                file_info.append({"name": f.name, "size_bytes": "unknown"})
+            if f.suffix in [".pkl", ".json"]:
+                try:
+                    size = f.stat().st_size
+                    file_info.append({
+                        "name":            f.name,
+                        "size_bytes":      size,
+                        "is_lfs_pointer":  size < 200
+                    })
+                except:
+                    file_info.append({"name": f.name, "size_bytes": "unknown"})
     return {
         "predictor_file":   str(Path(__file__).resolve()),
-        "model_dir":        MODEL_DIR,
-        "model_dir_exists": model_dir.exists(),
-        "files":            file_info,
+        "model_dir_used":   MODEL_DIR,
+        "clay_pkl_exists":  (Path(MODEL_DIR) / "clay_model.pkl").exists(),
+        "sand_pkl_exists":  (Path(MODEL_DIR) / "sand_model.pkl").exists(),
+        "json_exists":      (Path(MODEL_DIR) / "training_stats.json").exists(),
+        "relevant_files":   file_info,
         "cwd":              str(Path(os.getcwd())),
-        "cwd_contents":     sorted(os.listdir(os.getcwd()))[:20],
     }
 
 def compute_isbt(qt_mpa, fs_mpa):
@@ -93,11 +99,7 @@ def load_models():
     model_path = Path(MODEL_DIR)
     for soil in ["clay", "sand"]:
         pkl_path = model_path / f"{soil}_model.pkl"
-        if pkl_path.exists():
-            size = pkl_path.stat().st_size
-            if size < 200:
-                # This is a Git LFS pointer, not a real model file
-                continue
+        if pkl_path.exists() and pkl_path.stat().st_size > 200:
             with open(pkl_path, "rb") as f:
                 models[soil] = pickle.load(f)
     stats_path = model_path / "training_stats.json"
