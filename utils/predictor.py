@@ -10,7 +10,23 @@ import os
 
 PA_KPA = 100.0
 SANDY  = {"sand", "sand/silt"}
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+
+# Robust path resolution — works locally, in Jupyter, and on Streamlit Cloud
+def _find_model_dir():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models"),
+        os.path.join(os.getcwd(), "models"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+        "models",
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and any(
+            f.endswith(".pkl") for f in os.listdir(c)
+        ):
+            return os.path.abspath(c)
+    return os.path.abspath(candidates[0])
+
+MODEL_DIR = _find_model_dir()
 
 FEATURE_COLS = [
     "Depth_actual", "SRD_sim",
