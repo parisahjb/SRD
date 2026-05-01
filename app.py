@@ -176,7 +176,7 @@ st.markdown("""
 if not model_loaded:
     from utils.predictor import get_debug_info
     debug = get_debug_info()
-    st.error("⚠️ No trained models found in: " + debug["model_dir"])
+    st.error("⚠️ No trained models found in: " + debug["model_dir_used"])
     with st.expander("🔍 Debug info (share this with developer)"):
         st.json(debug)
     st.markdown("""
