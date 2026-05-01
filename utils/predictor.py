@@ -20,43 +20,58 @@ FEATURE_COLS = [
 ]
 
 def _find_model_dir():
+    """Find models/ directory — works locally and on Streamlit Cloud."""
     this_file = Path(__file__).resolve()
-    search_roots = [
-        this_file.parent,
-        this_file.parent.parent,
-        Path(os.getcwd()),
-        Path(os.getcwd()) / "pile_srd_app",
+    candidates = [
+        this_file.parent.parent / "models",   # repo root / models  (main case)
+        this_file.parent       / "models",    # utils / models
+        Path(os.getcwd())      / "models",    # cwd / models
+        Path("/mount/src/srd") / "models",    # Streamlit Cloud explicit path
     ]
-    for root in search_roots:
-        candidate = root / "models"
-        if candidate.is_dir() and list(candidate.glob("*.pkl")):
-            return str(candidate)
-    return str(this_file.parent.parent / "models")
+    for c in candidates:
+        if c.is_dir():
+            return str(c)                     # return first existing dir, no glob
+    return str(candidates[0])                 # fallback
 
 MODEL_DIR = _find_model_dir()
 
 def get_debug_info():
     model_dir = Path(MODEL_DIR)
-    files_in_model_dir = list(model_dir.iterdir()) if model_dir.exists() else []
+    file_info = []
+    if model_dir.exists():
+        for f in sorted(model_dir.iterdir()):
+            try:
+                size = f.stat().st_size
+                # Check if pkl file is a git-lfs pointer (< 200 bytes = pointer, not real model)
+                is_lfs = size < 200 and f.suffix == ".pkl"
+                file_info.append({
+                    "name": f.name,
+                    "size_bytes": size,
+                    "is_lfs_pointer": is_lfs
+                })
+            except:
+                file_info.append({"name": f.name, "size_bytes": "unknown"})
     return {
         "predictor_file":   str(Path(__file__).resolve()),
-        "model_dir":        str(model_dir),
+        "model_dir":        MODEL_DIR,
         "model_dir_exists": model_dir.exists(),
-        "files_in_model_dir": [f.name for f in files_in_model_dir],
+        "files":            file_info,
         "cwd":              str(Path(os.getcwd())),
-        "cwd_contents":     os.listdir(os.getcwd())[:20],
+        "cwd_contents":     sorted(os.listdir(os.getcwd()))[:20],
     }
 
 def compute_isbt(qt_mpa, fs_mpa):
     qt_norm = np.where(qt_mpa > 0, qt_mpa / PA_KPA, np.nan)
-    Rf_pct  = np.where((qt_mpa > 0) & (fs_mpa > 0), (fs_mpa / qt_mpa) * 100, np.nan)
+    Rf_pct  = np.where((qt_mpa > 0) & (fs_mpa > 0),
+                       (fs_mpa / qt_mpa) * 100, np.nan)
     return np.nan_to_num(
-        np.sqrt((3.47 - np.log10(qt_norm))**2 + (np.log10(Rf_pct) + 1.22)**2),
-        nan=2.0)
+        np.sqrt((3.47 - np.log10(qt_norm))**2 +
+                (np.log10(Rf_pct)  + 1.22)**2), nan=2.0)
 
 def engineer_features(df, tip_area=None, max_diameter=None):
     df = df.copy().sort_values("Depth_actual").reset_index(drop=True)
-    df["friction_ratio"] = (df["CPT_col3"] / df["CPT_col5"].replace(0, np.nan)).clip(0, 0.1)
+    df["friction_ratio"] = (
+        df["CPT_col3"] / df["CPT_col5"].replace(0, np.nan)).clip(0, 0.1)
     df["ISBT"]         = compute_isbt(df["CPT_col5"].values, df["CPT_col3"].values)
     df["tip_area"]     = float(tip_area)     if tip_area     is not None else 28.27
     df["max_diameter"] = float(max_diameter) if max_diameter is not None else 6.0
@@ -69,7 +84,8 @@ def engineer_features(df, tip_area=None, max_diameter=None):
     df["fs_cumulative"] = np.cumsum(fs_vals * np.abs(dz))
     df["qc_cumulative"] = np.cumsum(qt_vals * np.abs(dz))
     cum_t = np.cumsum(np.abs(dz))
-    df["pct_sand"] = np.where(cum_t > 0, np.cumsum(sandy * np.abs(dz)) / cum_t, 0.0)
+    df["pct_sand"] = np.where(
+        cum_t > 0, np.cumsum(sandy * np.abs(dz)) / cum_t, 0.0)
     return df
 
 def load_models():
@@ -78,6 +94,10 @@ def load_models():
     for soil in ["clay", "sand"]:
         pkl_path = model_path / f"{soil}_model.pkl"
         if pkl_path.exists():
+            size = pkl_path.stat().st_size
+            if size < 200:
+                # This is a Git LFS pointer, not a real model file
+                continue
             with open(pkl_path, "rb") as f:
                 models[soil] = pickle.load(f)
     stats_path = model_path / "training_stats.json"
@@ -97,8 +117,9 @@ def predict_srd(depth, srd_sim, qt_mpa, fs_mpa,
     fs_mpa  = np.array(fs_mpa,  dtype=float)
     if soil_labels is None:
         soil_labels = [soil_type] * len(depth)
-    df = pd.DataFrame({"Depth_actual": depth, "SRD_sim": srd_sim,
-                       "CPT_col5": qt_mpa, "CPT_col3": fs_mpa, "SoilType": soil_labels})
+    df = pd.DataFrame({
+        "Depth_actual": depth, "SRD_sim": srd_sim,
+        "CPT_col5": qt_mpa, "CPT_col3": fs_mpa, "SoilType": soil_labels})
     df = engineer_features(df, tip_area=tip_area, max_diameter=max_diameter)
     k_rough = srd_sim / np.clip(srd_sim.mean(), 1, None)
     k_std   = float(np.std(k_rough))
@@ -116,11 +137,14 @@ def predict_srd(depth, srd_sim, qt_mpa, fs_mpa,
     srd_corrected = K_applied * srd_sim
     srd_lower     = np.clip((K_applied - qhat) * srd_sim, 0, None)
     srd_upper     = (K_applied + qhat) * srd_sim
-    return {"depth": depth, "srd_sim": srd_sim, "srd_corrected": srd_corrected,
-            "srd_lower": srd_lower, "srd_upper": srd_upper,
-            "K_pred": K_applied, "K_std": k_std, "qhat": qhat,
-            "recommendation": recommendation, "mean_k_correction": mean_k,
-            "soil_type": soil_type, "site": site, "coverage": coverage}
+    return {
+        "depth": depth, "srd_sim": srd_sim,
+        "srd_corrected": srd_corrected,
+        "srd_lower": srd_lower, "srd_upper": srd_upper,
+        "K_pred": K_applied, "K_std": k_std, "qhat": qhat,
+        "recommendation": recommendation,
+        "mean_k_correction": mean_k,
+        "soil_type": soil_type, "site": site, "coverage": coverage}
 
 def read_cpt_mo(f):
     df = pd.read_csv(f, sep=r"\s+", header=None, engine="python")
@@ -140,5 +164,6 @@ def read_cpt_r(f):
         if "depth" in c: rename[c] = "Depth"
         elif c == "qt":  rename[c] = "qt_MPa"
         elif c == "fs":  rename[c] = "fs_MPa"
-    return df.rename(columns=rename)[["Depth","qt_MPa","fs_MPa"]].apply(
-        pd.to_numeric, errors="coerce").dropna()
+    return df.rename(columns=rename)[
+        ["Depth","qt_MPa","fs_MPa"]
+    ].apply(pd.to_numeric, errors="coerce").dropna()
