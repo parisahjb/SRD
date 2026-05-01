@@ -174,8 +174,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if not model_loaded:
-    st.error("⚠️ No trained models found. Please run the training notebook first "
-             "and copy the model files to the `models/` directory.")
+    from utils.predictor import get_debug_info
+    debug = get_debug_info()
+    st.error("⚠️ No trained models found in: " + debug["model_dir"])
+    with st.expander("🔍 Debug info (share this with developer)"):
+        st.json(debug)
+    st.markdown("""
+    **To fix:** Make sure these files exist in your repo's `models/` folder:
+    - `clay_model.pkl`
+    - `sand_model.pkl`  
+    - `training_stats.json`
+    """)
     st.stop()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
