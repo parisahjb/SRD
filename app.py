@@ -21,12 +21,15 @@ st.set_page_config(
 def find_file(filename):
     """Search for a file in all likely locations."""
     search_dirs = [
-        Path(__file__).parent,                    # same folder as app.py
-        Path(__file__).parent / "models",         # models/ subfolder
-        Path(os.getcwd()),                        # working directory
-        Path(os.getcwd()) / "models",             # working dir / models
-        Path("/mount/src/srd"),                   # Streamlit Cloud root
-        Path("/mount/src/srd") / "models",        # Streamlit Cloud models/
+        Path(__file__).parent,
+        Path(__file__).parent / "models",
+        Path(__file__).parent / "data",
+        Path(os.getcwd()),
+        Path(os.getcwd()) / "models",
+        Path(os.getcwd()) / "data",
+        Path("/mount/src/srd"),
+        Path("/mount/src/srd") / "models",
+        Path("/mount/src/srd") / "data",
     ]
     for d in search_dirs:
         f = d / filename
