@@ -190,14 +190,7 @@ correction  correction
 
 ---
 
-## Citation
 
-If you use this tool in research, please cite:
-
-```
-Philipp, J.M. (2026). Improving Pile Driving Predictions with Machine Learning.
-Master's Thesis, Aalborg University, Denmark.
-Collaboration: Florida Polytechnic University & COWI A/S.
 ```
 
 ---
