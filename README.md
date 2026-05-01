@@ -2,8 +2,7 @@
 
 ML-based correction of offshore pile driving simulations for monopile installation.
 
-**Research collaboration:**  
-Florida Polytechnic University × Aalborg University × COWI A/S
+
 
 ---
 
