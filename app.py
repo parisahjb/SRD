@@ -21,15 +21,12 @@ st.set_page_config(
 def find_file(filename):
     """Search for a file in all likely locations."""
     search_dirs = [
-        Path(__file__).parent,
-        Path(__file__).parent / "models",
-        Path(__file__).parent / "data",
-        Path(os.getcwd()),
-        Path(os.getcwd()) / "models",
-        Path(os.getcwd()) / "data",
-        Path("/mount/src/srd"),
-        Path("/mount/src/srd") / "models",
-        Path("/mount/src/srd") / "data",
+        Path(__file__).parent,                    # same folder as app.py
+        Path(__file__).parent / "models",         # models/ subfolder
+        Path(os.getcwd()),                        # working directory
+        Path(os.getcwd()) / "models",             # working dir / models
+        Path("/mount/src/srd"),                   # Streamlit Cloud root
+        Path("/mount/src/srd") / "models",        # Streamlit Cloud models/
     ]
     for d in search_dirs:
         f = d / filename
@@ -108,7 +105,7 @@ st.markdown("""
     <h1>🌊 Pile Driving SRD Correction Tool</h1>
     <p>ML-based correction of offshore pile driving simulations &nbsp;·&nbsp;
        Merkur (DE) + Rentel (BE) &nbsp;·&nbsp;
-       
+       Florida Polytechnic University × Aalborg University × COWI A/S</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -232,13 +229,15 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📊 Model Info")
     s = stats.get(soil_type, {})
+    model_type = s.get("model_type", "ANN")
+    st.markdown(f"**Model type:** {model_type}")
     st.metric("Training locations", s.get("n_locations", "—"))
     st.metric("Training rows",      s.get("n_rows", "—"))
     st.metric("Mean K (training)",  f"{s.get('mean_K', 0):.3f}")
     qhats_disp = s.get("qhats", {})
     qhat_disp  = qhats_disp.get(str(coverage), qhats_disp.get("0.9", 0.3))
     st.metric(f"qhat ({int(coverage*100)}% PI)", f"±{float(qhat_disp):.3f} K")
-    st.caption("K_std ≥ 0.15 → ML correction\nK_std < 0.15 → Mean correction")
+    st.caption("Clay: GBM model (no screening needed)\nSand: ANN — K_std ≥ 0.15 → ML, else → Mean")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["📁 Upload & Predict", "📈 Results", "ℹ️ About"])
@@ -381,12 +380,16 @@ with tab2:
                 unsafe_allow_html=True)
 
         st.markdown("&nbsp;")
-        if rec == "ML":
-            st.markdown(f'<div class="rec-ml">✅ ML CORRECTION APPLIED &nbsp;|&nbsp; '
+        if rec == "ML" and r["soil_type"] == "clay":
+            st.markdown(f'<div class="rec-ml">✅ GBM CORRECTION APPLIED (Clay) &nbsp;|&nbsp; '
+                        f'Applied at all depths &nbsp;|&nbsp; LOGO R²=0.416 &nbsp;|&nbsp; 51% RMSE reduction vs simulation</div>',
+                        unsafe_allow_html=True)
+        elif rec == "ML":
+            st.markdown(f'<div class="rec-ml">✅ ML CORRECTION APPLIED (Sand) &nbsp;|&nbsp; '
                         f'K_std={k_std:.3f} ≥ 0.15 → K varies with depth</div>',
                         unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="rec-mean">⚡ MEAN CORRECTION APPLIED &nbsp;|&nbsp; '
+            st.markdown(f'<div class="rec-mean">⚡ MEAN CORRECTION APPLIED (Sand) &nbsp;|&nbsp; '
                         f'K_std={k_std:.3f} < 0.15 → site mean K={mean_k:.3f}</div>',
                         unsafe_allow_html=True)
         st.markdown("&nbsp;")
@@ -486,7 +489,8 @@ with tab3:
         st.markdown("""
         ### About This Tool
         ML-based correction of pre-installation pile driving simulations for offshore
-        wind turbine monopiles. Developed as part of a research collaboration.
+        wind turbine monopiles. Developed as part of a research collaboration between
+        **Florida Polytechnic University**, **Aalborg University**, and **COWI A/S**.
 
         #### Key results (clay, leave-one-location-out)
         - **50% RMSE reduction** (46.4 → 23.2 MN)
