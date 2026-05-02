@@ -105,7 +105,7 @@ st.markdown("""
     <h1>🌊 Pile Driving SRD Correction Tool</h1>
     <p>ML-based correction of offshore pile driving simulations &nbsp;·&nbsp;
        Merkur (DE) + Rentel (BE) &nbsp;·&nbsp;
-       Florida Polytechnic University × Aalborg University × COWI A/S</p>
+       
 </div>
 """, unsafe_allow_html=True)
 
@@ -489,8 +489,7 @@ with tab3:
         st.markdown("""
         ### About This Tool
         ML-based correction of pre-installation pile driving simulations for offshore
-        wind turbine monopiles. Developed as part of a research collaboration between
-        **Florida Polytechnic University**, **Aalborg University**, and **COWI A/S**.
+        wind turbine monopiles. Developed as part of a research collaboration.
 
         #### Key results (clay, leave-one-location-out)
         - **50% RMSE reduction** (46.4 → 23.2 MN)
