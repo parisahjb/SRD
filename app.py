@@ -1,535 +1,357 @@
 """
-Pile Driving SRD Correction Tool
+Direct Blowcount Prediction — prototype interface
+Physics-guided ML for offshore monopile installation.
+
+Companion tool to the manuscript. Loads the saved model bundle
+(blowcount_model.joblib) and reproduces the paper's feature pipeline so
+that predictions match the reported results exactly.
+
+Run:  streamlit run blowcount_app.py
+Requires in the same folder:  blowcount_model.joblib
+
+The model bundle is expected to contain:
+    model      : HistGradientBoostingRegressor (point prediction)
+    q_lo, q_hi : quantile models (0.10, 0.90) for the prediction band
+    features   : list of 11 feature names, in order
+    median_impute : dict of median values for gap-filling
 """
-import streamlit as st
+
+import os
 import numpy as np
 import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import pickle, json, os, io, sys
-from pathlib import Path
+import joblib
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="SRD Correction Tool",
-    page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -----------------------------------------------------------------------------
+# CONSTANTS — must match the notebook pipeline exactly
+# -----------------------------------------------------------------------------
+PA_KPA = 100.0
+GAMMA_W = 9.81
+GAMMA_MIN, GAMMA_MAX = 14.0, 22.0
+QT_CEILING = 110.0
+WINDOW = 0.25            # 25 cm window above pile tip
+IC_SAND_MAX = 2.60
+K0_NC = 0.45
+LAMBDA_10 = 0.045
+MODEL_PATH = "blowcount_model.joblib"
 
-# ── Find models — check every possible location ───────────────────────────────
-def find_file(filename):
-    """Search for a file in all likely locations."""
-    search_dirs = [
-        Path(__file__).parent,                    # same folder as app.py
-        Path(__file__).parent / "models",         # models/ subfolder
-        Path(os.getcwd()),                        # working directory
-        Path(os.getcwd()) / "models",             # working dir / models
-        Path("/mount/src/srd"),                   # Streamlit Cloud root
-        Path("/mount/src/srd") / "models",        # Streamlit Cloud models/
-    ]
-    for d in search_dirs:
-        f = d / filename
-        if f.exists() and f.stat().st_size > 200:
-            return str(f)
-    return None
+# empirically measured on the blind holdout — the honest number
+BAND_NOMINAL = 80
+BAND_EMPIRICAL = 61
 
+st.set_page_config(page_title="Blowcount Prediction", layout="wide")
+
+
+# -----------------------------------------------------------------------------
+# FEATURE PIPELINE  (mirrors the notebook — do not edit without re-verifying)
+# -----------------------------------------------------------------------------
+def isbt_correct(qt_mpa, fs_mpa):
+    qt_kpa = np.asarray(qt_mpa, float) * 1000.0
+    qtn = np.where(qt_kpa > 0, qt_kpa / PA_KPA, np.nan)
+    rf = np.clip(np.where((qt_mpa > 0) & (fs_mpa > 0),
+                          (fs_mpa / qt_mpa) * 100, np.nan), 0.01, 10.0)
+    return np.sqrt((3.47 - np.log10(qtn)) ** 2 + (np.log10(rf) + 1.22) ** 2)
+
+
+def _strict_increasing_mask(z):
+    keep = np.zeros(len(z), bool)
+    last = -np.inf
+    for i, v in enumerate(z):
+        if v > last:
+            keep[i] = True
+            last = v
+    return keep
+
+
+def clean_cpt(raw):
+    """Restart removal (depth reversal), monotonic depth, fs floor, qt ceiling."""
+    q = raw.reset_index(drop=True).copy()
+    z = q["Depth"].values
+    rev = np.zeros(len(q), bool)
+    if len(q) > 1:
+        rev[1:] = np.diff(z) <= 0
+    bad = np.zeros(len(q), bool)
+    for i in np.where(rev)[0]:
+        bad |= (z >= z[i]) & (z <= z[i] + 0.10)
+    k = q[~bad].copy()
+    m = _strict_increasing_mask(k["Depth"].values)
+    k = k[m].copy()
+    k["fs_MPa"] = k["fs_raw"].fillna(0.0).clip(lower=0.001)
+    k["qt_MPa"] = k["qt_raw"].clip(upper=QT_CEILING)
+    return k.reset_index(drop=True)
+
+
+def add_stress_and_norm(c, n_iter=12):
+    d = c.sort_values("Depth").reset_index(drop=True).copy()
+    z = d["Depth"].values
+    qt = d["qt_MPa"].values * 1000.0
+    fs = d["fs_MPa"].values * 1000.0
+    Rf = np.clip(100.0 * fs / np.maximum(qt, 1e-6), 0.1, 10.0)
+    gam = GAMMA_W * (0.27 * np.log10(Rf)
+                     + 0.36 * np.log10(np.maximum(qt, 1e-6) / PA_KPA) + 1.236)
+    gam = np.clip(gam, GAMMA_MIN, GAMMA_MAX)
+    dz = np.diff(z, prepend=z[0])
+    dz[0] = z[0]
+    sv0 = np.cumsum(gam * dz)
+    u0 = GAMMA_W * z
+    sve = np.maximum(sv0 - u0, 1.0)
+    qnet = np.maximum(qt - sv0, 1.0)
+    Fr = np.clip(100.0 * fs / qnet, 0.1, 10.0)
+    n = np.ones_like(z)
+    for _ in range(n_iter):
+        Qtn = np.maximum((qnet / PA_KPA) * (PA_KPA / sve) ** n, 1e-3)
+        Ic = np.sqrt((3.47 - np.log10(Qtn)) ** 2 + (np.log10(Fr) + 1.22) ** 2)
+        n_new = np.clip(0.381 * Ic + 0.05 * (sve / PA_KPA) - 0.15, 0.0, 1.0)
+        if np.nanmax(np.abs(n_new - n)) < 1e-4:
+            n = n_new
+            break
+        n = n_new
+    Qtn = np.maximum((qnet / PA_KPA) * (PA_KPA / sve) ** n, 1e-3)
+    Ic = np.sqrt((3.47 - np.log10(Qtn)) ** 2 + (np.log10(Fr) + 1.22) ** 2)
+    d["sigma_v0_eff"] = sve
+    d["Qtn"] = Qtn
+    d["Fr_pct"] = Fr
+    d["Ic"] = Ic
+    return d
+
+
+def window_mean(z_pile, z_cpt, v_cpt, w=WINDOW):
+    out = np.full(len(z_pile), np.nan)
+    for i, zp in enumerate(z_pile):
+        m = (z_cpt <= zp) & (z_cpt >= zp - w)
+        if m.any():
+            out[i] = np.nanmean(v_cpt[m])
+        else:
+            j = np.argmin(np.abs(z_cpt - zp))
+            out[i] = v_cpt[j]
+    return out
+
+
+def build_features(cpt_df, pile_depths, srd_sim, hammer_kj, feature_names):
+    """cpt_df: Depth, qt_raw, fs_raw. Returns feature frame in model order."""
+    clean = clean_cpt(cpt_df)
+    norm = add_stress_and_norm(clean)
+    zc = norm["Depth"].values
+    zp = np.asarray(pile_depths, float)
+
+    qt_w = window_mean(zp, zc, norm["qt_MPa"].values)
+    fs_w = window_mean(zp, zc, norm["fs_MPa"].values)
+    Qtn_w = window_mean(zp, zc, norm["Qtn"].values)
+    Ic_w = window_mean(zp, zc, norm["Ic"].values)
+    Fr_w = window_mean(zp, zc, norm["Fr_pct"].values)
+
+    ic_row = np.interp(zp, zc, norm["Ic"].values)
+    sand = (ic_row < IC_SAND_MAX).astype(float)
+    dz = np.diff(zp, prepend=zp[0])
+    dz[0] = WINDOW
+    ct = np.cumsum(np.abs(dz))
+    pct_sand = np.where(ct > 0, np.cumsum(sand * np.abs(dz)) / ct, 0.0)
+
+    F = pd.DataFrame({
+        "Depth_actual": zp,
+        "SRD_sim": np.full(len(zp), srd_sim) if np.isscalar(srd_sim) else srd_sim,
+        "nominal_energy_kJ": hammer_kj,
+        "qt_w25": qt_w, "fs_w25": fs_w,
+        "friction_ratio": np.clip(fs_w / np.maximum(qt_w, 1e-6), 0, 0.1),
+        "ISBT": isbt_correct(qt_w, fs_w),
+        "pct_sand_lab": pct_sand,
+        "Qtn_w25": Qtn_w, "Ic_w25": Ic_w, "Fr_w25": Fr_w,
+    })
+    return F[feature_names], norm
+
+
+# -----------------------------------------------------------------------------
+# SYNTHETIC EXAMPLE  (sand with a clay interval, DanTysk-like)
+# -----------------------------------------------------------------------------
+def example_data():
+    rng = np.random.default_rng(7)
+    z = np.round(np.arange(0.02, 42.0, 0.02), 2)
+    qt = np.zeros_like(z)
+    for i, d in enumerate(z):
+        if d < 6:
+            base = 8 + 3.0 * d
+        elif d < 18:                       # clay interval
+            base = 1.3 + 0.05 * (d - 6)
+        else:                              # dense sand
+            base = 20 + 1.1 * (d - 18)
+        qt[i] = max(0.2, base + rng.normal(0, base * 0.08))
+    fs = np.clip(qt * np.where((z >= 6) & (z < 18), 0.028, 0.009), 0.001, None)
+    cpt = pd.DataFrame({"Depth": z, "qt_raw": qt, "fs_raw": fs})
+    pile = np.round(np.arange(3.0, 40.75, 0.25), 2)
+    return cpt, pile
+
+
+# -----------------------------------------------------------------------------
+# LOAD MODEL
+# -----------------------------------------------------------------------------
 @st.cache_resource
-def load_all_models():
-    models, stats = {}, {}
-    for soil in ["clay", "sand"]:
-        path = find_file(f"{soil}_model.pkl")
-        if path:
-            with open(path, "rb") as f:
-                models[soil] = pickle.load(f)
-    path = find_file("training_stats.json")
-    if path:
-        with open(path) as f:
-            stats = json.load(f)
-    return models, stats
+def load_bundle():
+    if not os.path.exists(MODEL_PATH):
+        return None, f"Model file '{MODEL_PATH}' not found in this folder."
+    b = joblib.load(MODEL_PATH)
+    need = {"model", "features"}
+    if not need.issubset(b.keys()):
+        return None, f"Bundle missing keys; found {list(b.keys())}."
+    return b, None
 
-models, stats = load_all_models()
-model_loaded  = len(models) > 0
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
-.title-block {
-    background: linear-gradient(135deg, #0A1628 0%, #1565C0 100%);
-    padding: 2rem 2.5rem; border-radius: 12px; margin-bottom: 1.5rem; color: white;
-}
-.title-block h1 {
-    font-family: 'IBM Plex Mono', monospace; font-size: 1.8rem;
-    font-weight: 600; margin: 0 0 0.3rem 0;
-}
-.title-block p { font-size: 0.95rem; opacity: 0.8; margin: 0; }
-.metric-card {
-    background: white; border: 1px solid #D0D7E8; border-radius: 10px;
-    padding: 1.2rem 1.5rem; text-align: center;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-}
-.metric-card .value {
-    font-family: 'IBM Plex Mono', monospace; font-size: 1.5rem;
-    font-weight: 600; color: #1565C0; line-height: 1;
-}
-.metric-card .label {
-    font-size: 0.78rem; color: #666; margin-top: 0.3rem;
-    text-transform: uppercase; letter-spacing: 0.5px;
-}
-.rec-ml {
-    background: #E8F5E9; border: 2px solid #2E7D32; border-radius: 8px;
-    padding: 1rem 1.5rem; color: #1B5E20; font-weight: 600;
-}
-.rec-mean {
-    background: #FFF8E1; border: 2px solid #F9A825; border-radius: 8px;
-    padding: 1rem 1.5rem; color: #795548; font-weight: 600;
-}
-.info-box {
-    background: #E3F2FD; border-left: 4px solid #1565C0;
-    padding: 0.8rem 1rem; border-radius: 0 8px 8px 0;
-    font-size: 0.88rem; color: #1A237E; margin: 0.5rem 0;
-}
-.stButton > button {
-    background: linear-gradient(135deg, #1565C0, #0D47A1); color: white;
-    border: none; border-radius: 8px; padding: 0.6rem 2rem;
-    font-weight: 600; font-size: 0.95rem; width: 100%;
-}
-</style>
-""", unsafe_allow_html=True)
+# =============================================================================
+# UI
+# =============================================================================
+st.title("Direct Blowcount Prediction")
+st.caption("Physics-guided machine learning for offshore monopile installation "
+           "— research prototype accompanying the manuscript.")
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="title-block">
-    <h1>🌊 Pile Driving SRD Correction Tool</h1>
-    <p>ML-based correction of offshore pile driving simulations &nbsp;·&nbsp;
-       Merkur (DE) + Rentel (BE) &nbsp;·&nbsp;
-       
-</div>
-""", unsafe_allow_html=True)
-
-# ── Model check ───────────────────────────────────────────────────────────────
-if not model_loaded:
-    st.error("⚠️ Models not loaded yet.")
-    with st.expander("🔍 Debug — click to see file search results"):
-        for fname in ["clay_model.pkl", "sand_model.pkl", "training_stats.json"]:
-            result = find_file(fname)
-            if result:
-                st.success(f"✅ {fname} found at: {result}")
-            else:
-                st.error(f"❌ {fname} NOT found")
-        st.write("**app.py location:**", str(Path(__file__).resolve()))
-        st.write("**cwd:**", os.getcwd())
-        st.write("**cwd contents:**", sorted(os.listdir(os.getcwd())))
-        sc_path = Path("/mount/src/srd")
-        if sc_path.exists():
-            st.write("**/mount/src/srd contents:**",
-                     sorted(os.listdir(str(sc_path))))
+bundle, err = load_bundle()
+if err:
+    st.error(err)
+    st.info("Place blowcount_model.joblib (saved from the analysis notebook) "
+            "in the same folder as this app.")
     st.stop()
 
-# ── Feature engineering ───────────────────────────────────────────────────────
-PA_KPA = 100.0
-SANDY  = {"sand", "sand/silt"}
-FEATURE_COLS = [
-    "Depth_actual", "SRD_sim", "CPT_col3", "CPT_col5",
-    "fs_cumulative", "qc_cumulative", "friction_ratio",
-    "ISBT", "tip_area", "max_diameter", "pct_sand"
-]
+FEATURES = bundle["features"]
+model = bundle["model"]
+qlo = bundle.get("q_lo")
+qhi = bundle.get("q_hi")
 
-def compute_isbt(qt, fs):
-    qt_n  = np.where(qt > 0, qt / PA_KPA, np.nan)
-    rf    = np.where((qt > 0) & (fs > 0), (fs / qt) * 100, np.nan)
-    return np.nan_to_num(
-        np.sqrt((3.47 - np.log10(qt_n))**2 + (np.log10(rf) + 1.22)**2), nan=2.0)
-
-def make_features(depth, srd_sim, qt, fs, soil_labels,
-                  tip_area=28.27, max_diameter=6.0):
-    df = pd.DataFrame({
-        "Depth_actual": depth, "SRD_sim": srd_sim,
-        "CPT_col5": qt, "CPT_col3": fs, "SoilType": soil_labels
-    }).sort_values("Depth_actual").reset_index(drop=True)
-    df["friction_ratio"] = (df["CPT_col3"] / df["CPT_col5"].replace(0, np.nan)).clip(0, 0.1)
-    df["ISBT"]           = compute_isbt(df["CPT_col5"].values, df["CPT_col3"].values)
-    df["tip_area"]       = tip_area
-    df["max_diameter"]   = max_diameter
-    dz = np.diff(df["Depth_actual"].values, prepend=df["Depth_actual"].values[0])
-    dz[0] = 0.02
-    df["fs_cumulative"] = np.cumsum(df["CPT_col3"].fillna(0).values * np.abs(dz))
-    df["qc_cumulative"] = np.cumsum(df["CPT_col5"].fillna(0).values * np.abs(dz))
-    sandy = df["SoilType"].str.lower().isin(SANDY).astype(float).values
-    cum_t = np.cumsum(np.abs(dz))
-    df["pct_sand"] = np.where(cum_t > 0, np.cumsum(sandy * np.abs(dz)) / cum_t, 0.0)
-    return df
-
-def run_prediction(depth, srd_sim, qt, fs, soil_type,
-                   soil_labels, tip_area, max_diameter, coverage, site):
-    df     = make_features(depth, srd_sim, qt, fs, soil_labels, tip_area, max_diameter)
-    k_std  = float(np.std(srd_sim / np.clip(srd_sim.mean(), 1, None)))
-    rec    = "ML" if k_std >= 0.15 else "MEAN"
-    if soil_type in models:
-        X      = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median()).values
-        K_pred = models[soil_type].predict(X).clip(0.2, 2.5)
-    else:
-        K_pred = np.ones(len(depth))
-    qhats  = stats.get(soil_type, {}).get("qhats", {})
-    qhat   = float(qhats.get(str(coverage), qhats.get("0.9", 0.30)))
-    mean_k = float(stats.get("site_mean_k", {}).get(
-        f"{soil_type}_{site}", stats.get("global_mean_k", 1.0)))
-    K_app  = K_pred if rec == "ML" else np.full_like(K_pred, mean_k)
-    return {
-        "depth": depth, "srd_sim": srd_sim,
-        "srd_corrected": K_app * srd_sim,
-        "srd_lower":     np.clip((K_app - qhat) * srd_sim, 0, None),
-        "srd_upper":     (K_app + qhat) * srd_sim,
-        "K_pred": K_app, "K_std": k_std, "qhat": qhat,
-        "recommendation": rec, "mean_k": mean_k,
-        "soil_type": soil_type, "site": site, "coverage": coverage
-    }
-
-# ── CPT readers ───────────────────────────────────────────────────────────────
-def read_cpt_mo(f):
-    df = pd.read_csv(f, sep=r"\s+", header=None, engine="python")
-    if df.shape[1] < 5:
-        raise ValueError("MO CPT needs ≥5 columns. Col 0=depth, 2=qt, 4=fs")
-    return pd.DataFrame({
-        "Depth":  pd.to_numeric(df.iloc[:,0], errors="coerce"),
-        "qt_MPa": pd.to_numeric(df.iloc[:,2], errors="coerce"),
-        "fs_MPa": pd.to_numeric(df.iloc[:,4], errors="coerce"),
-    }).dropna()
-
-def read_cpt_r(f):
-    df = pd.read_csv(f, sep=r"\s+", engine="python")
-    df.columns = df.columns.str.strip().str.lower()
-    rename = {c: "Depth" for c in df.columns if "depth" in c}
-    rename.update({c: "qt_MPa" for c in df.columns if c == "qt"})
-    rename.update({c: "fs_MPa" for c in df.columns if c == "fs"})
-    return df.rename(columns=rename)[["Depth","qt_MPa","fs_MPa"]].apply(
-        pd.to_numeric, errors="coerce").dropna()
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-    site_label = st.selectbox("Wind farm site",
-                              ["R — Rentel (Belgium)", "MO — Merkur (Germany)"])
-    site_key   = "R" if site_label.startswith("R") else "MO"
-    soil_type  = st.selectbox("Dominant soil type", ["clay", "sand"])
-    cpt_format = st.radio("CPT file format", [
-        "R-format (.txt with header)",
-        "MO-format (.dat no header)",
-        "Generic CSV (Depth, qt, fs)"
-    ])
-    diameter  = st.number_input("Max pile diameter [m]", 4.0, 12.0, 6.0, 0.1)
-    tip_area  = np.pi / 4 * diameter**2
-    st.caption(f"Tip area = {tip_area:.2f} m²")
-    coverage  = st.select_slider(
-        "Prediction interval coverage",
-        options=[0.70, 0.80, 0.90, 0.95], value=0.90,
-        format_func=lambda x: f"{int(x*100)}%")
-    st.markdown("---")
-    st.markdown("### 📊 Model Info")
-    s = stats.get(soil_type, {})
-    model_type = s.get("model_type", "ANN")
-    st.markdown(f"**Model type:** {model_type}")
-    st.metric("Training locations", s.get("n_locations", "—"))
-    st.metric("Training rows",      s.get("n_rows", "—"))
-    st.metric("Mean K (training)",  f"{s.get('mean_K', 0):.3f}")
-    qhats_disp = s.get("qhats", {})
-    qhat_disp  = qhats_disp.get(str(coverage), qhats_disp.get("0.9", 0.3))
-    st.metric(f"qhat ({int(coverage*100)}% PI)", f"±{float(qhat_disp):.3f} K")
-    st.caption("Clay: GBM model (no screening needed)\nSand: ANN — K_std ≥ 0.15 → ML, else → Mean")
+    st.header("Input")
+    src = st.radio("Data source",
+                   ["Load worked example", "Upload CPT file"])
+    st.divider()
+    st.subheader("Pre-installation inputs")
+    hammer = st.selectbox("Hammer", ["IHC IQIP S-3000 (3000 kJ)",
+                                     "IHC IQIP S-4000 (4000 kJ)"])
+    hammer_kj = 3000.0 if "3000" in hammer else 4000.0
+    srd_mode = st.radio("Simulated SRD (SRD_sim)",
+                        ["Constant value", "From uploaded column"])
+    srd_const = st.number_input("SRD_sim [kN]", value=120000.0, step=10000.0,
+                                disabled=(srd_mode != "Constant value"))
+    target_depth = st.number_input("Target embedment [m]", value=40.0, step=1.0)
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📁 Upload & Predict", "📈 Results", "ℹ️ About"])
+    st.divider()
+    st.caption(f"Prediction band is nominally {BAND_NOMINAL}% but achieved "
+               f"**{BAND_EMPIRICAL}%** empirical coverage on the blind test "
+               f"site. Treat the band as indicative, not calibrated, on "
+               f"unseen geologies.")
 
-# ── TAB 1: UPLOAD ─────────────────────────────────────────────────────────────
-with tab1:
-    col_cpt, col_sim = st.columns(2)
-
-    with col_cpt:
-        st.markdown("#### 📂 CPT Data")
-        st.markdown('<div class="info-box">Upload CPT file. '
-                    'Columns: Depth [m], qt [MPa], fs [MPa]</div>',
-                    unsafe_allow_html=True)
-        cpt_file       = st.file_uploader("Upload CPT", type=["txt","dat","csv"])
-        use_sample_cpt = st.checkbox("Use sample data (R3, Rentel clay)")
-        cpt_df = None
-        if use_sample_cpt:
-            p = find_file("sample_CPT_R3.csv")
-            if p:
-                cpt_df = pd.read_csv(p)
-                st.success(f"✓ Sample CPT: {len(cpt_df)} rows")
+# ---- assemble input ----------------------------------------------------------
+cpt_df, pile_depths, srd_vec = None, None, None
+if src == "Load worked example":
+    cpt_df, pile_depths = example_data()
+    srd_vec = srd_const
+    st.success("Loaded a synthetic sand profile containing a clay interval "
+               "(6–18 m), mimicking the blind test site.")
+else:
+    up = st.file_uploader("CPT file: whitespace/tab-delimited, columns "
+                          "Depth, qt, fs (or Depth, qc, qc, fs, fs)",
+                          type=["txt", "dat", "csv"])
+    if up is not None:
+        try:
+            raw = pd.read_csv(up, sep=r"\s+", header=None, engine="python",
+                              comment="#")
+            if raw.shape[1] >= 5:
+                cpt_df = pd.DataFrame({"Depth": raw.iloc[:, 0],
+                                       "qt_raw": raw.iloc[:, 2],
+                                       "fs_raw": raw.iloc[:, 4]})
+            elif raw.shape[1] >= 3:
+                cpt_df = pd.DataFrame({"Depth": raw.iloc[:, 0],
+                                       "qt_raw": raw.iloc[:, 1],
+                                       "fs_raw": raw.iloc[:, 2]})
             else:
-                st.warning("Sample CPT not found — upload a file instead.")
-        elif cpt_file:
-            try:
-                if "R-format"  in cpt_format: cpt_df = read_cpt_r(cpt_file)
-                elif "MO-format" in cpt_format: cpt_df = read_cpt_mo(cpt_file)
-                else:
-                    cpt_df = pd.read_csv(cpt_file)
-                    cpt_df.columns = [c.strip() for c in cpt_df.columns]
-                    rn = {}
-                    for c in cpt_df.columns:
-                        cl = c.lower()
-                        if "depth" in cl: rn[c] = "Depth"
-                        elif "qt"  in cl: rn[c] = "qt_MPa"
-                        elif "fs"  in cl: rn[c] = "fs_MPa"
-                    cpt_df = cpt_df.rename(columns=rn)
-                st.success(f"✓ CPT: {len(cpt_df)} rows, "
-                           f"depth {cpt_df['Depth'].min():.1f}–{cpt_df['Depth'].max():.1f} m")
-            except Exception as e:
-                st.error(f"CPT read error: {e}")
-        if cpt_df is not None:
-            with st.expander("Preview CPT"):
-                st.dataframe(cpt_df.head(8), use_container_width=True)
+                st.error("Need at least 3 columns (Depth, qt, fs).")
+            if cpt_df is not None:
+                cpt_df = cpt_df.apply(pd.to_numeric, errors="coerce") \
+                               .dropna(subset=["Depth", "qt_raw"]) \
+                               .query("Depth >= 0").reset_index(drop=True)
+                pile_depths = np.round(
+                    np.arange(3.0, min(target_depth, cpt_df.Depth.max()) + 0.25,
+                              0.25), 2)
+                srd_vec = srd_const
+        except Exception as e:
+            st.error(f"Could not parse file: {e}")
 
-    with col_sim:
-        st.markdown("#### 📊 Simulation Data")
-        st.markdown('<div class="info-box">Upload simulation CSV. '
-                    'Columns: Depth_actual [m], SRD_sim [kN]</div>',
-                    unsafe_allow_html=True)
-        sim_file       = st.file_uploader("Upload Simulation CSV", type=["csv"])
-        use_sample_sim = st.checkbox("Use sample simulation (R3)")
-        sim_df = None
-        if use_sample_sim:
-            p = find_file("sample_SIM_R3.csv")
-            if p:
-                sim_df = pd.read_csv(p)
-                st.success(f"✓ Sample sim: {len(sim_df)} rows")
-            else:
-                st.warning("Sample simulation not found — upload a file instead.")
-        elif sim_file:
-            try:
-                sim_df = pd.read_csv(sim_file)
-                sim_df.columns = [c.strip() for c in sim_df.columns]
-                st.success(f"✓ Simulation: {len(sim_df)} rows")
-            except Exception as e:
-                st.error(f"Simulation read error: {e}")
-        if sim_df is not None:
-            with st.expander("Preview simulation"):
-                st.dataframe(sim_df.head(8), use_container_width=True)
+if cpt_df is None:
+    st.info("Choose the worked example or upload a CPT file to begin.")
+    st.stop()
 
-    st.markdown("---")
-    ready   = cpt_df is not None and sim_df is not None
-    run_btn = st.button("🚀 Run SRD Correction", disabled=not ready)
-    if not ready:
-        st.caption("Upload or select sample data for both CPT and simulation to run.")
+# ---- predict -----------------------------------------------------------------
+Feat, norm = build_features(cpt_df, pile_depths, srd_vec, hammer_kj, FEATURES)
+med = bundle.get("median_impute", {})
+Feat = Feat.fillna(pd.Series(med)) if med else Feat.fillna(Feat.median())
 
-    if run_btn and ready:
-        with st.spinner("Computing features and running ML correction…"):
-            try:
-                sim_df = sim_df.sort_values("Depth_actual").reset_index(drop=True)
-                cpt_df = cpt_df.sort_values("Depth").reset_index(drop=True)
-                sim_df["_dk"] = sim_df["Depth_actual"].round(1)
-                cpt_df["_dk"] = cpt_df["Depth"].round(1)
-                cpt_agg = cpt_df.groupby("_dk", as_index=False).agg(
-                    qt_MPa=("qt_MPa","mean"), fs_MPa=("fs_MPa","mean"))
-                merged = sim_df.merge(cpt_agg, on="_dk", how="left")
-                merged["qt_MPa"] = merged["qt_MPa"].interpolate().bfill().fillna(1.0)
-                merged["fs_MPa"] = merged["fs_MPa"].interpolate().bfill().fillna(0.05)
-                soil_labels = (merged["SoilGroup"].fillna(soil_type).tolist()
-                               if "SoilGroup" in merged.columns
-                               else [soil_type]*len(merged))
-                result = run_prediction(
-                    depth        = merged["Depth_actual"].values,
-                    srd_sim      = merged["SRD_sim"].values,
-                    qt           = merged["qt_MPa"].values,
-                    fs           = merged["fs_MPa"].values,
-                    soil_type    = soil_type,
-                    soil_labels  = soil_labels,
-                    tip_area     = tip_area,
-                    max_diameter = diameter,
-                    coverage     = coverage,
-                    site         = site_key
-                )
-                st.session_state["result"] = result
-                st.success("✓ Done — see the Results tab")
-            except Exception as e:
-                st.error(f"Prediction error: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+pred = model.predict(Feat.values)
+pred = np.clip(pred, 0, None)
+lo = qlo.predict(Feat.values) if qlo is not None else pred * 0.6
+hi = qhi.predict(Feat.values) if qhi is not None else pred * 1.4
+lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+lo = np.clip(lo, 0, None)
 
-# ── TAB 2: RESULTS ────────────────────────────────────────────────────────────
-with tab2:
-    if "result" not in st.session_state:
-        st.info("Run a prediction in the Upload tab first.")
-    else:
-        r        = st.session_state["result"]
-        depth    = r["depth"];    srd_s = r["srd_sim"]
-        srd_c    = r["srd_corrected"]
-        srd_lo   = r["srd_lower"]; srd_hi = r["srd_upper"]
-        K_pred   = r["K_pred"];   k_std  = r["K_std"]
-        rec      = r["recommendation"]; qhat = r["qhat"]
-        mean_k   = r["mean_k"]
-        cov_pct  = int(r["coverage"] * 100)
+cum = np.cumsum(pred)
+total_blows = cum[-1]
 
-        # Metrics row
-        c1,c2,c3,c4,c5 = st.columns(5)
-        for col, val, lbl in [
-            (c1, str(len(depth)),          "Depth points"),
-            (c2, f"{np.mean(K_pred):.3f}", "Mean K predicted"),
-            (c3, f"±{qhat:.3f}",           f"qhat ({cov_pct}% PI)"),
-            (c4, f"{k_std:.3f}",           "K_std (screening)"),
-            (c5, rec,                      "Recommendation"),
-        ]:
-            clr = "#2E7D32" if (lbl=="Recommendation" and val=="ML") else \
-                  "#C8860A" if (lbl=="Recommendation") else "#1565C0"
-            col.markdown(f"""<div class="metric-card">
-                <div class="value" style="color:{clr}">{val}</div>
-                <div class="label">{lbl}</div></div>""",
-                unsafe_allow_html=True)
+# ---- headline ----------------------------------------------------------------
+c1, c2, c3 = st.columns(3)
+c1.metric("Predicted total blows to target", f"{total_blows:,.0f}")
+c2.metric("Target embedment", f"{pile_depths[-1]:.1f} m")
+c3.metric("Prediction band (empirical)", f"{BAND_EMPIRICAL}%",
+          help="Fraction of true values expected within the band on unseen sites.")
 
-        st.markdown("&nbsp;")
-        if rec == "ML" and r["soil_type"] == "clay":
-            st.markdown(f'<div class="rec-ml">✅ GBM CORRECTION APPLIED (Clay) &nbsp;|&nbsp; '
-                        f'Applied at all depths &nbsp;|&nbsp; LOGO R²=0.416 &nbsp;|&nbsp; 51% RMSE reduction vs simulation</div>',
-                        unsafe_allow_html=True)
-        elif rec == "ML":
-            st.markdown(f'<div class="rec-ml">✅ ML CORRECTION APPLIED (Sand) &nbsp;|&nbsp; '
-                        f'K_std={k_std:.3f} ≥ 0.15 → K varies with depth</div>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="rec-mean">⚡ MEAN CORRECTION APPLIED (Sand) &nbsp;|&nbsp; '
-                        f'K_std={k_std:.3f} < 0.15 → site mean K={mean_k:.3f}</div>',
-                        unsafe_allow_html=True)
-        st.markdown("&nbsp;")
+# ---- plots -------------------------------------------------------------------
+plt.rcParams.update({"font.size": 10, "axes.linewidth": 1.2})
+BLUE, BLACK, CLAY = "#2b6cb0", "#1a1a1a", "#e8dcc0"
 
-        # Plots
-        fig = plt.figure(figsize=(16, 7))
-        fig.patch.set_facecolor("#F8FAFF")
-        gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
-        CB, CG, CGR = "#1565C0", "#2E7D32", "#78909C"
-        ck = CG if rec=="ML" else "#F9A825"
-        corr_pct = (srd_c - srd_s) / srd_s * 100
+colA, colB = st.columns(2)
+with colA:
+    fig, ax = plt.subplots(figsize=(4.6, 5.2))
+    clay = norm[(norm.Ic > IC_SAND_MAX)]
+    if len(clay):
+        for _, seg in clay.groupby((clay.Depth.diff() > 0.5).cumsum()):
+            ax.axhspan(seg.Depth.min(), seg.Depth.max(),
+                       color=CLAY, alpha=0.6, zorder=0)
+    ax.fill_betweenx(pile_depths, lo, hi, color=BLUE, alpha=0.15,
+                     label=f"{BAND_NOMINAL}% band ({BAND_EMPIRICAL}% emp.)")
+    ax.plot(pred, pile_depths, "-", color=BLUE, lw=2, label="Predicted")
+    ax.invert_yaxis()
+    ax.set_xlabel("Blowcount (blows / 25 cm)", fontweight="bold")
+    ax.set_ylabel("Depth below seabed (m)", fontweight="bold")
+    ax.set_xlim(left=0)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    ax.set_title("Blowcount profile", fontweight="bold", loc="left")
+    st.pyplot(fig)
 
-        ax = fig.add_subplot(gs[0])
-        ax.fill_betweenx(depth, srd_lo/1000, srd_hi/1000, alpha=0.2, color=CB)
-        ax.plot(srd_c/1000, depth, "-",  color=CB,  lw=2.5, label="ML-corrected")
-        ax.plot(srd_s/1000, depth, "--", color=CGR, lw=1.5, alpha=0.8, label="Simulated")
-        ax.invert_yaxis(); ax.set_facecolor("white")
-        ax.set_xlabel("SRD [MN]"); ax.set_ylabel("Depth [m]")
-        ax.set_title("Corrected SRD Profile\n(shaded = prediction interval)",
-                     fontweight="bold"); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+with colB:
+    fig2, ax2 = plt.subplots(figsize=(4.6, 5.2))
+    ax2.plot(cum, pile_depths, "-", color=BLACK, lw=2.2)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Cumulative blows to depth", fontweight="bold")
+    ax2.set_ylabel("Depth below seabed (m)", fontweight="bold")
+    ax2.set_xlim(left=0)
+    for s in ("top", "right"):
+        ax2.spines[s].set_visible(False)
+    ax2.annotate(f"{total_blows:,.0f} blows\nto target",
+                 (cum[-1], pile_depths[-1]),
+                 xytext=(cum[-1] * 0.45, pile_depths[-1] + 3),
+                 fontsize=9, fontweight="bold", color=BLUE,
+                 arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.2))
+    ax2.set_title("Cumulative blows", fontweight="bold", loc="left")
+    st.pyplot(fig2)
 
-        ax = fig.add_subplot(gs[1])
-        ax.plot(K_pred, depth, "-", color=ck, lw=2.5)
-        ax.fill_betweenx(depth, K_pred-qhat, K_pred+qhat, alpha=0.2, color=ck)
-        ax.axvline(1.0,    color="red",     lw=1.5, ls="--", label="K=1 (perfect)")
-        ax.axvline(mean_k, color="#C8860A", lw=1.5, ls=":",  label=f"Mean K={mean_k:.2f}")
-        ax.invert_yaxis(); ax.set_facecolor("white")
-        ax.set_xlabel("K [-]"); ax.set_ylabel("Depth [m]")
-        ax.set_title(f"K Correction Factor\n({rec} applied)",
-                     fontweight="bold", color=ck)
-        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+# ---- table + download --------------------------------------------------------
+out = pd.DataFrame({"Depth_m": pile_depths,
+                    "Predicted_blowcount": np.round(pred, 1),
+                    "Band_low": np.round(lo, 1),
+                    "Band_high": np.round(hi, 1),
+                    "Cumulative_blows": np.round(cum, 0)})
+with st.expander("Prediction table"):
+    st.dataframe(out, use_container_width=True, height=280)
+st.download_button("Download predictions (CSV)",
+                   out.to_csv(index=False).encode(),
+                   "blowcount_predictions.csv", "text/csv")
 
-        ax = fig.add_subplot(gs[2])
-        clrs = ["#2E7D32" if v < 0 else "#C62828" for v in corr_pct]
-        ax.barh(depth, corr_pct, height=0.15, color=clrs, alpha=0.8)
-        ax.axvline(0, color="black", lw=1.5)
-        ax.axvline(float(np.mean(corr_pct)), color=CB, lw=1.5, ls="--",
-                   label=f"Mean {np.mean(corr_pct):+.1f}%")
-        ax.invert_yaxis(); ax.set_facecolor("white")
-        ax.set_xlabel("SRD Change [%]"); ax.set_ylabel("Depth [m]")
-        ax.set_title("Correction per Depth\n(green=reduction, red=increase)",
-                     fontweight="bold")
-        ax.legend(fontsize=9); ax.grid(True, alpha=0.3, axis="x")
-        fig.suptitle(
-            f"SRD Correction  |  Site: {r['site']}  |  Soil: {r['soil_type'].capitalize()}"
-            f"  |  n={len(depth)}  |  {cov_pct}% PI",
-            fontweight="bold", color="#0A1628", y=1.01)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-
-        # Downloads
-        st.markdown("---")
-        st.markdown("#### 📥 Download")
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            res_df = pd.DataFrame({
-                "Depth_m":             depth,
-                "SRD_sim_kN":          srd_s,
-                "SRD_corrected_kN":    srd_c,
-                "SRD_lower_kN":        srd_lo,
-                "SRD_upper_kN":        srd_hi,
-                "K_factor":            K_pred,
-                "SRD_change_pct":      corr_pct,
-            })
-            st.download_button("⬇️ Corrected SRD (CSV)",
-                data=res_df.to_csv(index=False).encode(),
-                file_name=f"srd_corrected_{r['site']}_{r['soil_type']}.csv",
-                mime="text/csv")
-        with dl2:
-            buf = io.BytesIO()
-            fig.savefig(buf, dpi=150, bbox_inches="tight")
-            buf.seek(0)
-            st.download_button("⬇️ Plot (PNG)",
-                data=buf,
-                file_name=f"srd_correction_{r['site']}_{r['soil_type']}.png",
-                mime="image/png")
-
-        # Summary
-        st.markdown("---")
-        st.markdown("#### 📋 Summary")
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(f"**Simulation**\n- Mean: {np.mean(srd_s)/1000:.1f} MN\n"
-                    f"- Min: {np.min(srd_s)/1000:.1f} MN\n"
-                    f"- Max: {np.max(srd_s)/1000:.1f} MN")
-        c2.markdown(f"**ML-Corrected**\n- Mean: {np.mean(srd_c)/1000:.1f} MN\n"
-                    f"- Min: {np.min(srd_c)/1000:.1f} MN\n"
-                    f"- Max: {np.max(srd_c)/1000:.1f} MN")
-        c3.markdown(f"**{cov_pct}% Prediction Interval**\n"
-                    f"- Lower mean: {np.mean(srd_lo)/1000:.1f} MN\n"
-                    f"- Upper mean: {np.mean(srd_hi)/1000:.1f} MN\n"
-                    f"- Mean width: {np.mean(srd_hi-srd_lo)/1000:.1f} MN")
-
-# ── TAB 3: ABOUT ──────────────────────────────────────────────────────────────
-with tab3:
-    col_a, col_b = st.columns([3, 2])
-    with col_a:
-        st.markdown("""
-        ### About This Tool
-        ML-based correction of pre-installation pile driving simulations for offshore
-        wind turbine monopiles. Developed as part of a research collaboration.
-
-        #### Key results (clay, leave-one-location-out)
-        - **50% RMSE reduction** (46.4 → 23.2 MN)
-        - **99% bias reduction** (+30.9 → -0.2 MN)
-        - **34/38 locations improved** vs raw simulation
-        - **90% conformal intervals** with exact empirical coverage
-
-        #### Two-stage decision rule
-        - **K_std ≥ 0.15** → ML correction (depth-varying K)
-        - **K_std < 0.15** → Site mean K correction (constant)
-
-        #### Training data
-        - 51 locations, 5,379 depth-matched rows
-        - Rentel (Belgium, R): clay-dominated
-        - Merkur (Germany, MO): sand-dominated
-        """)
-    with col_b:
-        st.markdown("""
-        ### File Format Guide
-
-        **CPT — R format (.txt)**
-        ```
-        Depth  qc    fs     qt
-        0.02   1.42  0.000  1.419
-        ```
-
-        **CPT — MO format (.dat)**
-        ```
-        0.000  0.164  0.164  0.000  0.000
-        0.020  0.325  0.325  0.000  0.000
-        ```
-        Col 0=depth, 2=qt, 4=fs, no header.
-
-        **Simulation CSV**
-        ```
-        Depth_actual,SRD_sim,SoilGroup
-        10.5,68450,clay
-        ```
-        SRD in kN. SoilGroup optional.
-        """)
-    st.caption(
-        "⚠️ For research and planning purposes only. "
-        "All predictions should be reviewed by a qualified geotechnical engineer.")
+st.caption("Prototype for research demonstration. Predictions on geologies "
+           "unlike the training sites (Rentel, Merkur) may be unreliable; the "
+           "prediction band is indicative only. Not validated for design use.")
